@@ -1,25 +1,31 @@
-"""Streamlit app: HMAC-Based Message Authentication System (Activity 18).
+"""
+app.py - Streamlit demo of a real-world HMAC request-authentication model.
+
+Tabs: Overview, Client (signs), Server (verifies), Attack Scenarios.
+All cryptography lives in hmac_service.py. Secrets are generated randomly per
+session, never shown, never logged, and never hardcoded.
 
 Run: streamlit run app.py
 """
 
+import time
+from html import escape
+
 import streamlit as st
 
-import crypto_utils as cu
+import hmac_service as hs
 
-st.set_page_config(page_title="HMAC Message Authentication", page_icon="🛡️", layout="centered")
+st.set_page_config(page_title="HMAC Request Authentication", page_icon="🛡️", layout="centered")
 
-# Dark navy theme with cyan/green accents (base colors are set in .streamlit/config.toml).
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 4rem; max-width: 820px; }
+    .block-container { padding-top: 4rem; max-width: 880px; }
     .app-header { border: 1px solid #1f3558; border-left: 4px solid #22d3ee; border-radius: 10px;
                   background: linear-gradient(135deg, #10203d 0%, #0b1426 80%);
                   padding: 1.1rem 1.4rem; margin-bottom: 1.2rem; }
-    .app-header h1 { font-size: 1.7rem; margin: 0; padding: 0; color: #e6edf7; }
+    .app-header h1 { font-size: 1.6rem; margin: 0; padding: 0; color: #e6edf7; }
     .app-header p { margin: .3rem 0 0 0; color: #8da2c0; font-size: .95rem; }
-    .app-header p span { color: #34d399; font-weight: 600; }
     h3 { color: #22d3ee; }
     .stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid #1f3558; }
     .stTabs [data-baseweb="tab"] { background: #101c33; border-radius: 8px 8px 0 0;
@@ -27,114 +33,175 @@ st.markdown(
     .stTabs [aria-selected="true"] { background: #13213b; color: #22d3ee; }
     div[data-testid="stCode"] pre { border: 1px solid #1f3558; border-radius: 8px;
                                     background: #0a1120 !important; }
-    div[data-testid="stCode"] code { color: #22d3ee !important; word-break: break-all;
-                                     white-space: pre-wrap !important; }
+    div[data-testid="stCode"] code { color: #22d3ee !important; white-space: pre-wrap !important;
+                                     word-break: break-all; }
     .stTextArea textarea, .stTextInput input { background: #0a1120; border: 1px solid #1f3558; }
-    .stTextArea textarea:focus, .stTextInput input:focus { border-color: #22d3ee; }
     .stButton > button { border-radius: 8px; border: 1px solid #1f3558; }
-    .stButton > button[kind="primary"] { background: #22d3ee; border-color: #22d3ee; color: #0b1426; font-weight: 600; }
-    .stButton > button[kind="primary"]:hover { background: #34d399; border-color: #34d399; color: #0b1426; }
-    div[data-testid="stAlert"] { border-radius: 8px; }
+    .stButton > button[kind="primary"] { background: #22d3ee; border-color: #22d3ee;
+                                         color: #0b1426; font-weight: 600; }
+    .stButton > button[kind="primary"]:hover { background: #34d399; border-color: #34d399; }
+    .check { padding: .35rem .8rem; border: 1px solid #1f3558; border-radius: 8px;
+             margin-bottom: .35rem; background: #101c33; }
+    .check.pass { border-left: 4px solid #34d399; } .check.fail { border-left: 4px solid #f87171; }
+    .check.skipped { border-left: 4px solid #3b4a63; color: #6c7f9e; }
     </style>
     <div class="app-header">
-      <h1>🛡️ HMAC-Based Message Authentication System</h1>
-      <p>HMAC-SHA256 with a shared secret key <span>● ready</span></p>
+      <h1>🛡️ HMAC Request Authentication</h1>
+      <p>Signed requests with timestamp, nonce, replay protection and key rotation</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+# --------------------------------------------------------------------------- state
+if "store" not in st.session_state:
+    store = hs.KeyStore()
+    store.create_key("key-1")                      # random 256-bit secret, never displayed
+    st.session_state["store"] = store
+    st.session_state["verifier"] = hs.Verifier(store)
+store: hs.KeyStore = st.session_state["store"]
+verifier: hs.Verifier = st.session_state["verifier"]
 
-def load_from_sender() -> None:
-    """Copy the sender's message and tag into the receiver (the key is NOT copied)."""
-    result = st.session_state.get("sender_result")
-    if result:
-        st.session_state["rx_message"] = result["message"]
-        st.session_state["rx_tag"] = result["tag"]
+
+def send_to_server() -> None:
+    """Callback: put the signed request 'on the wire' (the Server tab fields)."""
+    req = st.session_state.get("signed")
+    if req:
+        h = req["headers"]
+        st.session_state.update(
+            srv_method=req["method"], srv_path=req["path"], srv_key_id=h["x-key-id"],
+            srv_ts=h["x-timestamp"], srv_nonce=h["x-nonce"], srv_sig=h["x-signature"],
+            srv_body=req["body"],
+        )
+        st.session_state["sent"] = True
 
 
-tab_sender, tab_receiver, tab_compare = st.tabs(
-    ["Sender", "Receiver and HMAC Verification", "Plain Hash vs HMAC"]
+tab_over, tab_client, tab_server, tab_attack = st.tabs(
+    ["Overview", "Client", "Server", "Attack Scenarios"]
 )
 
-# ----------------------------------------------------------------------------- Sender
-with tab_sender:
-    st.subheader("Sender")
-    message = st.text_area("Message", key="tx_message")
-    key = st.text_input("Shared secret key", type="password", key="tx_key")
+# --------------------------------------------------------------------------- overview
+with tab_over:
+    st.subheader("How it works")
+    st.markdown(
+        """
+**HMAC** proves a message was not changed and came from a holder of a shared secret key:
+`HMAC(K, m) = SHA256((K ⊕ opad) ‖ SHA256((K ⊕ ipad) ‖ m))`.
 
-    if st.button("Generate HMAC", type="primary"):
+Real systems sign more than the message. The **client** signs this canonical string:
+
+```
+METHOD \\n PATH \\n TIMESTAMP \\n NONCE \\n SHA256(BODY)
+```
+
+and sends four headers: `x-key-id`, `x-timestamp`, `x-nonce`, `x-signature: v1=<hex>`.
+
+The **server** then checks, in order:
+1. all headers are present
+2. the key ID exists and is not revoked
+3. the timestamp is within ±5 minutes
+4. the signature format is valid
+5. the recomputed HMAC matches, using `hmac.compare_digest()`
+6. the nonce has not been used before (replay protection)
+
+HMAC gives integrity and shared-key authentication. It does **not** encrypt the body
+(use TLS) and does **not** give non-repudiation (both sides hold the key).
+        """
+    )
+
+# --------------------------------------------------------------------------- client
+with tab_client:
+    st.subheader("Client: sign a request")
+    c1, c2 = st.columns(2)
+    key_id = c1.selectbox("Key ID", store.key_ids() or ["(none)"], key="cl_key")
+    method = c2.selectbox("Method", ["POST", "GET", "PUT", "DELETE"], key="cl_method")
+    path = st.text_input("Path", value="/v1/payments", key="cl_path")
+    body = st.text_area("Body", value='{"to": "alice", "amount": 500}', key="cl_body", height=100)
+
+    if st.button("Sign request", type="primary"):
+        secret = store.get(key_id)
         try:
-            st.session_state["sender_result"] = {
-                "message": message,
-                "tag": cu.generate_hmac(message, key),
-            }
+            headers = hs.sign_request(key_id, secret, method, path, body.encode("utf-8"))
+            st.session_state["signed"] = {"method": method, "path": path, "body": body,
+                                          "headers": headers}
+            st.session_state["sent"] = False
         except ValueError as exc:
-            st.session_state.pop("sender_result", None)
+            st.session_state.pop("signed", None)
             st.error(str(exc))
 
-    result = st.session_state.get("sender_result")
-    if result:
-        st.write("Original message")
-        st.code(result["message"], language=None)
-        st.write("HMAC tag")
-        st.code(result["tag"], language=None)
+    signed = st.session_state.get("signed")
+    if signed:
+        st.success("Request signed.")
+        h = signed["headers"]
+        st.write("String that was signed")
+        st.code(hs.canonical_string(signed["method"], signed["path"], int(h["x-timestamp"]),
+                                    h["x-nonce"], signed["body"].encode("utf-8")), language=None)
+        st.write("Headers sent with the request")
+        st.code("\n".join(f"{k}: {v}" for k, v in h.items()), language=None)
+        st.button("Send to Server", on_click=send_to_server)
+        if st.session_state.get("sent"):
+            st.info("Sent. Open the Server tab. You can edit any field there to play the attacker.")
 
-# --------------------------------------------------------------------------- Receiver
-with tab_receiver:
-    st.subheader("Receiver and HMAC Verification")
-    st.button("Load message and tag from Sender", on_click=load_from_sender)
-    rx_message = st.text_area("Received message", key="rx_message")
-    rx_tag = st.text_input("Received HMAC tag", key="rx_tag")
-    rx_key = st.text_input("Shared secret key", type="password", key="rx_key")
+# --------------------------------------------------------------------------- server
+with tab_server:
+    st.subheader("Server: verify a request")
+    st.caption("These fields are what arrived over the network. Edit them to simulate an attacker.")
+    s1, s2 = st.columns(2)
+    s_method = s1.text_input("Method", key="srv_method")
+    s_path = s2.text_input("Path", key="srv_path")
+    s_body = st.text_area("Body", key="srv_body", height=90)
+    s3, s4 = st.columns(2)
+    s_key = s3.text_input("x-key-id", key="srv_key_id")
+    s_ts = s4.text_input("x-timestamp", key="srv_ts")
+    s_nonce = st.text_input("x-nonce", key="srv_nonce")
+    s_sig = st.text_input("x-signature", key="srv_sig")
 
-    if st.button("Verify", type="primary"):
-        if not rx_message or not rx_tag or not rx_key:
-            st.error("Enter the message, the HMAC tag, and the shared secret key.")
+    offset = st.slider("Simulate time passing on the server (seconds)", 0, 900, 0, step=30,
+                       help="Above 300 seconds, a normally signed request becomes stale.")
+    verifier.clock = lambda: time.time() + offset
+
+    if st.button("Verify request", type="primary"):
+        headers = {"x-key-id": s_key, "x-timestamp": s_ts, "x-nonce": s_nonce, "x-signature": s_sig}
+        try:
+            res = verifier.verify(s_method, s_path, headers, s_body.encode("utf-8"))
+        except Exception:
+            st.error("Unexpected error while verifying.")
         else:
-            ok, explanation = cu.verify_hmac(rx_message, rx_key, rx_tag)
-            (st.success if ok else st.error)(explanation)
-            if ok or len(rx_tag.strip()) == cu.TAG_HEX_LENGTH:
-                try:
-                    st.write("Calculated HMAC")
-                    st.code(cu.generate_hmac(rx_message, rx_key), language=None)
-                    st.write("Received HMAC")
-                    st.code(rx_tag.strip(), language=None)
-                except ValueError:
-                    pass
+            (st.success if res.ok else st.error)(f"{res.code}: {res.message}")
+            for label, status in res.checks:
+                icon = {"pass": "✓", "fail": "✗", "skipped": "–"}[status]
+                st.markdown(f'<div class="check {status}">{icon} {escape(label)}</div>',
+                            unsafe_allow_html=True)
+            st.caption("Real servers return a generic 401 to clients and log the specific reason.")
 
-    st.divider()
-    st.subheader("Independent verification scenarios")
-    st.caption("Uses the message and shared secret key entered in the Sender tab.")
-    if st.button("Run the four scenarios"):
-        try:
-            rows = cu.run_four_scenarios(st.session_state.get("tx_message", ""),
-                                         st.session_state.get("tx_key", ""))
-            for name, expected, actual in rows:
-                label = lambda s: "Verification successful" if s else "Verification unsuccessful"
-                line = f"{name}: expected {label(expected)}, got {label(actual)}"
-                (st.success if expected == actual else st.error)(
-                    f"{'PASS' if expected == actual else 'FAIL'} - {line}"
-                )
-        except (ValueError, IndexError):
-            st.error("Enter a message and a shared secret key in the Sender tab first.")
+    with st.expander("Key management (rotation and revocation)"):
+        ids = store.key_ids()
+        st.write("Active key IDs: " + (", ".join(ids) if ids else "none"))
+        k1, k2 = st.columns(2)
+        if k1.button("Create new key"):
+            n = 1
+            while f"key-{n}" in ids:
+                n += 1
+            store.create_key(f"key-{n}")
+            st.rerun()
+        if ids:
+            to_revoke = k2.selectbox("Revoke key", ids, key="revoke_sel")
+            if k2.button("Revoke selected key"):
+                store.revoke(to_revoke)
+                st.rerun()
 
-# ----------------------------------------------------------------------------- Compare
-with tab_compare:
-    st.subheader("Plain Hash vs HMAC")
-    c_message = st.text_area("Message", key="cmp_message")
-    c_key = st.text_input("Shared secret key", type="password", key="cmp_key")
-
-    if st.button("Compare", type="primary"):
-        try:
-            st.write("Plain SHA-256 hash (no key)")
-            st.code(cu.plain_sha256(c_message), language=None)
-            st.write("HMAC-SHA256 (with shared secret key)")
-            st.code(cu.generate_hmac(c_message, c_key), language=None)
-            st.info(
-                "A plain hash uses no secret, so anyone can compute it. An attacker can change "
-                "the message and calculate a new valid hash, and the receiver cannot tell who "
-                "created it. An HMAC can only be produced by someone who knows the shared secret key."
-            )
-        except ValueError as exc:
-            st.error(str(exc))
+# --------------------------------------------------------------------------- attacks
+with tab_attack:
+    st.subheader("Attack scenarios")
+    st.caption("Runs on a fresh server with random keys. PASS means the server behaved as expected.")
+    if st.button("Run all scenarios", type="primary"):
+        st.session_state["scenarios"] = hs.run_scenarios()
+    rows = st.session_state.get("scenarios")
+    if rows:
+        passed = sum(r.passed for r in rows)
+        (st.success if passed == len(rows) else st.error)(f"{passed} of {len(rows)} scenarios passed.")
+        for r in rows:
+            with st.container(border=True):
+                st.markdown(f"**{'PASS' if r.passed else 'FAIL'}** - {r.name}")
+                st.caption(r.description)
+                st.markdown(f"Expected `{r.expected}`, got `{r.actual}`")
